@@ -19,10 +19,12 @@ Variables opcionales (OAuth, no requeridas para scraping):
 """
 
 import os
+import re
 import sys
 import time
 import logging
 import httpx
+from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
 # ── Config ──────────────────────────────────────────────────────────
@@ -58,16 +60,13 @@ async def get_ml_token() -> str:
         return resp.json()["access_token"]
 
 
-async def search_ml(query: str, limit: int = 50) -> list[dict]:
-    """Busca productos en Mercado Libre Colombia usando Playwright (navegador real).
-
-    Mercado Libre requiere JavaScript y un navegador real. Playwright lanza
-    Chromium headless que ML no puede distinguir de un usuario genuino.
-    """
+async def search_ml(query: str, limit: int = 50, access_token: str | None = None) -> list[dict]:
+    """Busca productos en Mercado Libre Colombia usando Playwright."""
     encoded_query = query.replace(" ", "-").replace("+", "-")
     url = f"https://listado.mercadolibre.com.co/{encoded_query}"
 
     results = []
+    screenshot_path = f"/tmp/ml_debug_{query.replace(' ', '_')}.png"
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -91,89 +90,186 @@ async def search_ml(query: str, limit: int = 50) -> list[dict]:
             )
             page = await context.new_page()
 
-            # Visit home page first to get session cookies
+            logger.debug("Visiting ML home page...")
             await page.goto("https://www.mercadolibre.com.co/", wait_until="domcontentloaded", timeout=15000)
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(3000)
 
+            logger.debug(f"Navigating to: {url}")
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await page.wait_for_timeout(5000)
 
-            try:
-                await page.wait_for_selector("li.ui-search-layout__item, ol.ui-search-layout li", timeout=10000)
-            except Exception:
-                logger.warning(f"No product cards found for '{query}' after 10s")
+            page_title = await page.title()
+            page_url = page.url
+            body_text = await page.evaluate("() => document.body ? document.body.innerText.substring(0, 500) : 'NO BODY'")
+
+            logger.info(f"Page title: {page_title}")
+            logger.info(f"Final URL: {page_url}")
+            logger.info(f"Body preview: {body_text[:200]}")
+
+            if "account-verification" in page_url or "verification" in page_url.lower():
+                logger.warning(f"ML redirected to verification page for '{query}'")
+                await page.screenshot(path=screenshot_path)
+                logger.info(f"Screenshot saved: {screenshot_path}")
                 await browser.close()
                 return []
 
-            for _ in range(min(limit // 24 + 1, 5)):
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(1500)
+            no_results = await page.evaluate("""() => {
+                const body = document.body ? document.body.innerText : '';
+                return body.includes('No encontramos') || body.includes('no hay resultados') || body.includes('sin resultados');
+            }""")
+            if no_results:
+                logger.info(f"ML returned 'no results' page for '{query}'")
+                await browser.close()
+                return []
 
-            products = await page.evaluate("""() => {
-                const items = document.querySelectorAll('li.ui-search-layout__item, div.ui-search-result__wrapper, div.andes-card');
+            # STRATEGY 1: JS extraction with multiple selector fallbacks
+            products_raw = await page.evaluate("""() => {
                 const results = [];
 
-                items.forEach(item => {
-                    const link = item.querySelector('a.ui-search-link, a[href*="/MCO-"]');
-                    if (!link) return;
-                    const href = link.href || link.getAttribute('href') || '';
-                    const idMatch = href.match(/MCO-(\\d+)/);
-                    if (!idMatch) return;
+                const selectors = [
+                    'li.ui-search-layout__item',
+                    'div.ui-search-result__wrapper',
+                    'div.ui-search-result',
+                    'ol.ui-search-layout > li',
+                    'div.andes-card',
+                    '[class*="ui-search"] a[href*="/MCO-"]',
+                ];
 
-                    const titleEl = item.querySelector('h2, h3, .ui-search-item__title');
-                    const title = titleEl ? titleEl.innerText.trim() : (link.title || link.getAttribute('title') || '');
-                    if (!title) return;
+                let items = [];
+                for (const sel of selectors) {
+                    items = document.querySelectorAll(sel);
+                    if (items.length > 0) break;
+                }
 
-                    let price = 0;
-                    const priceEl = item.querySelector('.price-tag-fraction, .andes-money-amount__fraction, span.andes-money-amount__fraction');
-                    if (priceEl) {
-                        price = parseFloat(priceEl.innerText.replace(/\\./g, '').replace(/,/g, '.')) || 0;
+                if (items.length === 0) {
+                    const links = document.querySelectorAll('a[href*="/MCO-"]');
+                    for (const link of links) {
+                        const card = link.closest('li, div[class], article');
+                        if (card && !results.find(r => r.url === link.href)) {
+                            results.push({
+                                url: link.href,
+                                title: link.title || link.getAttribute('aria-label') || link.innerText.trim().substring(0, 100),
+                                cardHTML: card.outerHTML.substring(0, 500)
+                            });
+                        }
                     }
+                    return results;
+                }
 
-                    const img = item.querySelector('img.ui-search-result-image__element, img[src*="mlstatic"]');
+                items.forEach(item => {
+                    const link = item.querySelector('a[href*="/MCO-"]');
+                    if (!link) return;
+
+                    const href = link.href || '';
+                    const idMatch = href.match(/MCO-?(\\d+)/);
+                    const mlId = idMatch ? idMatch[1].substring(0, 20) : '';
+                    if (!mlId) return;
+
+                    const titleEl = item.querySelector('h2, h3, .ui-search-item__title, [class*="title"]');
+                    const title = titleEl ? titleEl.innerText.trim() : (link.title || '');
+
+                    const priceEl = item.querySelector('.price-tag-fraction, .andes-money-amount__fraction, [class*="price"] [class*="fraction"], span[class*="amount"]');
+                    const priceText = priceEl ? priceEl.innerText.replace(/[^0-9]/g, '') : '0';
+                    const price = parseInt(priceText) || 0;
+
+                    const img = item.querySelector('img[src*="mlstatic"], img[src*="mercadolibre"], img');
                     const thumbnail = img ? (img.src || img.getAttribute('data-src') || '') : '';
 
-                    let soldQuantity = 0;
-                    const soldEl = Array.from(item.querySelectorAll('*')).find(el => /vendido/i.test(el.innerText));
-                    if (soldEl) {
-                        const soldMatch = soldEl.innerText.match(/(\\d+)\\s+vendido/i);
-                        if (soldMatch) soldQuantity = parseInt(soldMatch[1]) || 0;
-                    }
+                    let soldQty = 0;
+                    const allText = item.innerText;
+                    const soldMatch = allText.match(/(\\d+)\\s*vendid/i);
+                    if (soldMatch) soldQty = parseInt(soldMatch[1]) || 0;
 
-                    let sellerNickname = '';
-                    const sellerEl = Array.from(item.querySelectorAll('*')).find(el => /^por\\s/i.test(el.innerText));
-                    if (sellerEl) {
-                        const sellerMatch = sellerEl.innerText.match(/por\\s+(\\S+)/i);
-                        if (sellerMatch) sellerNickname = sellerMatch[1];
-                    }
-
-                    let rating = null;
-                    const ratingEl = item.querySelector('.ui-search-reviews__rating, [class*="star"]');
-                    if (ratingEl) {
-                        const ratingMatch = ratingEl.innerText.match(/(\\d+\\.?\\d*)/);
-                        if (ratingMatch) rating = parseFloat(ratingMatch[1]) || null;
-                    }
+                    let seller = '';
+                    const sellerMatch = allText.match(/por\\s+(\\S+)/i);
+                    if (sellerMatch) seller = sellerMatch[1];
 
                     results.push({
-                        ml_product_id: idMatch[1].substring(0, 20),
-                        title: title.substring(0, 300),
+                        ml_product_id: mlId,
+                        title: (title || '').substring(0, 300),
                         price_cop: price,
-                        sold_quantity: soldQuantity,
+                        sold_quantity: soldQty,
                         available_quantity: 0,
-                        rating: rating,
-                        seller_id: sellerNickname.substring(0, 20),
-                        seller_nickname: sellerNickname.substring(0, 100),
+                        rating: null,
+                        seller_id: seller.substring(0, 20),
+                        seller_nickname: seller.substring(0, 100),
                         category_id: '',
                         condition: 'new',
                         thumbnail: thumbnail,
-                        permalink: href.startsWith('http') ? href : 'https://www.mercadolibre.com.co' + href,
+                        permalink: href,
                     });
                 });
 
                 return results;
             }""")
 
+            logger.info(f"JS extraction found {len(products_raw)} items")
+
+            # STRATEGY 2: BeautifulSoup HTML parse if JS found nothing
+            if not products_raw:
+                logger.warning("JS extraction found 0 items — falling back to HTML parse")
+                html = await page.content()
+
+                html_path = f"/tmp/ml_html_{query.replace(' ', '_')}.html"
+                with open(html_path, "w") as f:
+                    f.write(html[:50000])
+                logger.info(f"HTML saved to {html_path} (first 50KB)")
+
+                soup = BeautifulSoup(html, "html.parser")
+                for link in soup.select('a[href*="/MCO-"]')[:limit]:
+                    href = link.get("href", "")
+                    id_match = re.search(r'/MCO-?(\d+)', href)
+                    if not id_match:
+                        continue
+
+                    ml_id = id_match.group(1)[:20]
+                    title = link.get("title") or link.get_text(strip=True)
+                    if not title or len(title) < 3:
+                        continue
+
+                    price_el = None
+                    parent = link.parent
+                    for _ in range(5):
+                        if parent is None:
+                            break
+                        price_el = parent.select_one('[class*="price"], [class*="Price"], .andes-money-amount')
+                        if price_el:
+                            break
+                        parent = parent.parent
+
+                    price = 0
+                    if price_el:
+                        price_text = price_el.get_text(strip=True)
+                        price_match = re.search(r'[\d.]+', price_text.replace(".", "").replace(",", "."))
+                        if price_match:
+                            try:
+                                price = int(float(price_match.group()))
+                            except Exception:
+                                pass
+
+                    products_raw.append({
+                        "ml_product_id": ml_id,
+                        "title": title[:300],
+                        "price_cop": price,
+                        "sold_quantity": 0,
+                        "available_quantity": 0,
+                        "rating": None,
+                        "seller_id": "",
+                        "seller_nickname": "",
+                        "category_id": "",
+                        "condition": "new",
+                        "thumbnail": "",
+                        "permalink": href if href.startswith("http") else f"https://www.mercadolibre.com.co{href}",
+                    })
+
+                logger.info(f"HTML fallback found {len(products_raw)} items")
+
+            if not products_raw:
+                await page.screenshot(path=screenshot_path)
+                logger.warning(f"0 products found for '{query}'. Screenshot: {screenshot_path}")
+
             seen = set()
-            for prod in products:
+            for prod in products_raw:
                 pid = prod.get("ml_product_id", "")
                 if pid and pid not in seen:
                     seen.add(pid)
@@ -182,7 +278,12 @@ async def search_ml(query: str, limit: int = 50) -> list[dict]:
             logger.info(f"ML scrape '{query}' → {len(results)} productos (Playwright)")
 
         except Exception as e:
-            logger.error(f"Playwright error for '{query}': {e}")
+            logger.error(f"Playwright error for '{query}': {e}", exc_info=True)
+            try:
+                await page.screenshot(path=screenshot_path)
+                logger.info(f"Error screenshot: {screenshot_path}")
+            except Exception:
+                pass
         finally:
             await browser.close()
 
