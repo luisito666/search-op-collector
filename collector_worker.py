@@ -3,7 +3,7 @@
 Search-OP Collector Worker — Raspberry Pi Daemon.
 
 Hace polling cada 2 minutos al servidor para recibir jobs pendientes,
-busca productos reales en Mercado Libre (IP residencial → sin bloqueo),
+busca productos reales en Mercado Libre vía scraping HTML (IP residencial),
 y envía los resultados de vuelta.
 
 Uso:
@@ -11,18 +11,20 @@ Uso:
 
 Variables de entorno requeridas:
     SEARCHOP_SERVER_URL    — URL del servidor Search-OP (ej: https://searchop.luisito.dev)
+    SEARCHOP_POLL_SECONDS  — Intervalo de polling en segundos (default: 120)
+
+Variables opcionales (OAuth, no requeridas para scraping):
     SEARCHOP_ML_CLIENT_ID  — Mercado Libre App client_id
     SEARCHOP_ML_CLIENT_SECRET — Mercado Libre App client_secret
-    SEARCHOP_POLL_SECONDS  — Intervalo de polling en segundos (default: 120)
 """
 
 import os
+import re
 import sys
 import time
-import json
 import logging
 import httpx
-from datetime import datetime, timezone
+from bs4 import BeautifulSoup
 
 # ── Config ──────────────────────────────────────────────────────────
 
@@ -58,51 +60,143 @@ async def get_ml_token() -> str:
 
 
 async def search_ml(query: str, limit: int = 50, access_token: str | None = None) -> list[dict]:
-    """Busca productos en Mercado Libre Colombia.
+    """Busca productos en Mercado Libre Colombia vía scraping HTML.
 
-    Si hay access_token, usa API autenticada. Si no, intenta pública.
-    Retorna lista de snapshots listos para enviar al servidor.
+    Desde IP residencial colombiana, la web pública de ML no bloquea.
+    Parseamos los resultados del listado para extraer datos reales de productos.
     """
-    headers = {"Accept": "application/json"}
-    if access_token:
-        headers["Authorization"] = f"Bearer {access_token}"
+    encoded_query = query.replace(" ", "-").replace("+", "-")
+    url = f"https://listado.mercadolibre.com.co/{encoded_query}"
 
-    url = f"{ML_API_BASE}/sites/MCO/search?q={query}&limit={limit}"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "es-CO,es;q=0.9,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "DNT": "1",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
 
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
         resp = await client.get(url, headers=headers)
 
-    if resp.status_code == 403:
-        logger.warning(f"ML search 403 for '{query}' — IP bloqueada o scope insuficiente")
-        return []
     if resp.status_code != 200:
-        logger.error(f"ML search failed: {resp.status_code} for '{query}'")
+        logger.warning(f"ML page returned {resp.status_code} for '{query}'")
         return []
 
-    data = resp.json()
+    if "suspicious-traffic" in resp.text or "account-verification" in resp.text:
+        logger.warning(f"ML returned CAPTCHA/suspicious traffic page for '{query}'")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    items = soup.select("li.ui-search-layout__item, div.ui-search-result__wrapper, ol.ui-search-layout li")
+    if not items:
+        items = soup.select("[class*='ui-search-result']")
+
     results = []
+    for item in items[:limit]:
+        try:
+            title_elem = item.select_one("h2, h3, .ui-search-item__title")
+            title = title_elem.get_text(strip=True) if title_elem else ""
+            if not title:
+                title_elem = item.select_one("a[title]")
+                title = title_elem.get("title", "") if title_elem else ""
+            if not title:
+                continue
 
-    for item in data.get("results", []):
-        seller = item.get("seller", {})
-        shipping = item.get("shipping", {})
+            price_cop = 0.0
+            price_elem = item.select_one(".price-tag-fraction, .andes-money-amount__fraction, span.andes-money-amount__fraction")
+            if price_elem:
+                price_text = price_elem.get_text(strip=True).replace(".", "").replace(",", "")
+                try:
+                    price_cop = float(price_text)
+                except ValueError:
+                    pass
 
-        results.append({
-            "ml_product_id": str(item.get("id", ""))[:20],
-            "title": str(item.get("title", ""))[:300],
-            "price_cop": float(item.get("price", 0)),
-            "sold_quantity": int(item.get("sold_quantity", 0)),
-            "available_quantity": int(item.get("available_quantity", 0)),
-            "rating": item.get("rating"),
-            "seller_id": str(seller.get("id", ""))[:20],
-            "seller_nickname": str(seller.get("nickname", ""))[:100],
-            "category_id": str(item.get("category_id", "")),
-            "condition": str(item.get("condition", "new")),
-            "thumbnail": str(item.get("thumbnail", "")),
-            "permalink": str(item.get("permalink", "")),
-        })
+            permalink = ""
+            link_elem = item.select_one("a.ui-search-link, a[href*='/MCO-']")
+            if link_elem:
+                permalink = link_elem.get("href", "")
+                if permalink and not permalink.startswith("http"):
+                    permalink = "https://www.mercadolibre.com.co" + permalink
 
-    logger.info(f"ML search '{query}' → {len(results)} productos")
-    return results
+            ml_product_id = ""
+            if permalink:
+                match = re.search(r'/MCO-(\d+)', permalink)
+                if match:
+                    ml_product_id = match.group(1)
+            if not ml_product_id:
+                item_id_elem = item.select_one("[id*='MLC'], [id*='MCO']")
+                if item_id_elem:
+                    id_match = re.search(r'MCO(\d+)', item_id_elem.get("id", ""))
+                    if id_match:
+                        ml_product_id = id_match.group(1)
+            if not ml_product_id:
+                continue
+
+            thumbnail = ""
+            img_elem = item.select_one("img.ui-search-result-image__element, img[src*='mlstatic'], img[data-src]")
+            if img_elem:
+                thumbnail = img_elem.get("src") or img_elem.get("data-src") or ""
+
+            sold_quantity = 0
+            sold_elem = item.find(string=re.compile(r'\d+\s+vendido', re.IGNORECASE))
+            if sold_elem:
+                sold_match = re.search(r'(\d+)\s+vendido', sold_elem, re.IGNORECASE)
+                if sold_match:
+                    sold_quantity = int(sold_match.group(1))
+
+            seller_nickname = ""
+            seller_elem = item.find(string=re.compile(r'por\s+\w+', re.IGNORECASE))
+            if seller_elem:
+                seller_match = re.search(r'por\s+(\S+)', seller_elem, re.IGNORECASE)
+                if seller_match:
+                    seller_nickname = seller_match.group(1)
+
+            rating = None
+            rating_elem = item.select_one(".ui-search-reviews__rating, [class*='star']")
+            if rating_elem:
+                rating_text = rating_elem.get_text(strip=True)
+                rating_match = re.search(r'(\d+\.?\d*)', rating_text)
+                if rating_match:
+                    try:
+                        rating = float(rating_match.group(1))
+                    except ValueError:
+                        pass
+
+            results.append({
+                "ml_product_id": ml_product_id[:20],
+                "title": title[:300],
+                "price_cop": price_cop,
+                "sold_quantity": sold_quantity,
+                "available_quantity": 0,
+                "rating": rating,
+                "seller_id": seller_nickname[:20],
+                "seller_nickname": seller_nickname[:100],
+                "category_id": "",
+                "condition": "new",
+                "thumbnail": thumbnail,
+                "permalink": permalink,
+            })
+        except Exception as e:
+            logger.debug(f"Error parsing item in '{query}': {e}")
+            continue
+
+    seen = set()
+    unique_results = []
+    for r in results:
+        if r["ml_product_id"] not in seen:
+            seen.add(r["ml_product_id"])
+            unique_results.append(r)
+
+    logger.info(f"ML scrape '{query}' → {len(unique_results)} productos (from HTML)")
+    return unique_results
 
 
 # ── Server API ──────────────────────────────────────────────────────
@@ -162,8 +256,7 @@ async def process_job(job: dict):
 
     try:
         if action == "search":
-            token = await get_ml_token()
-            snapshots = await search_ml(query, limit=limit, access_token=token)
+            snapshots = await search_ml(query, limit=limit)
             await submit_job_results(job_id, "completed", snapshots)
         else:
             await submit_job_results(
@@ -201,8 +294,7 @@ if __name__ == "__main__":
 
     # Validar configuración
     if not ML_CLIENT_ID or not ML_CLIENT_SECRET:
-        logger.error("SEARCHOP_ML_CLIENT_ID and SEARCHOP_ML_CLIENT_SECRET are required")
-        sys.exit(1)
+        logger.warning("ML credentials not set — OAuth features disabled, but HTML scraping works without them")
 
     logger.info(f"Search-OP Collector Worker v0.1.0")
     logger.info(f"Server: {SERVER_URL}")
