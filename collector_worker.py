@@ -98,7 +98,7 @@ async def search_ml(query: str, limit: int = 50, access_token: str | None = None
             card_selector = (
                 "li.ui-search-layout__item, div.ui-search-result__wrapper, "
                 "div.ui-search-result, ol.ui-search-layout > li, "
-                "div.andes-card, .poly-card, a[href*=\"MCO-\"]"
+                "div.andes-card, .poly-card, a[href*=\"MCO\"]"
             )
             try:
                 await page.wait_for_selector(card_selector, timeout=20000)
@@ -152,7 +152,7 @@ async def search_ml(query: str, limit: int = 50, access_token: str | None = None
                 }
 
                 if (items.length === 0) {
-                    const links = document.querySelectorAll('a[href*="/MCO-"]');
+                    const links = document.querySelectorAll('a[href*="/MCO"]');
                     for (const link of links) {
                         const card = link.closest('li, div[class], article');
                         if (card && !results.find(r => r.url === link.href)) {
@@ -167,7 +167,7 @@ async def search_ml(query: str, limit: int = 50, access_token: str | None = None
                 }
 
                 items.forEach(item => {
-                    const link = item.querySelector('a[href*="/MCO-"]');
+                    const link = item.querySelector('a[href*="/MCO"]');
                     if (!link) return;
 
                     const href = link.href || '';
@@ -178,7 +178,9 @@ async def search_ml(query: str, limit: int = 50, access_token: str | None = None
                     const titleEl = item.querySelector('h2, h3, .ui-search-item__title, [class*="title"]');
                     const title = titleEl ? titleEl.innerText.trim() : (link.title || '');
 
-                    const priceEl = item.querySelector('.price-tag-fraction, .andes-money-amount__fraction, [class*="price"] [class*="fraction"], span[class*="amount"]');
+                    const priceContainer = item.querySelector('.poly-price__current') || item;
+                    const priceEl = priceContainer.querySelector('.andes-money-amount__fraction, .price-tag-fraction')
+                        || item.querySelector('.andes-money-amount__fraction, .price-tag-fraction');
                     const priceText = priceEl ? priceEl.innerText.replace(/[^0-9]/g, '') : '0';
                     const price = parseInt(priceText) || 0;
 
@@ -229,7 +231,7 @@ async def search_ml(query: str, limit: int = 50, access_token: str | None = None
                 logger.info(f"Body HTML saved to {html_path} (first 50KB of <body>)")
 
                 soup = BeautifulSoup(html, "html.parser")
-                for link in soup.select('a[href*="/MCO-"]')[:limit]:
+                for link in soup.select('a[href*="/MCO"]')[:limit]:
                     href = link.get("href", "")
                     id_match = re.search(r'/MCO-?(\d+)', href)
                     if not id_match:
