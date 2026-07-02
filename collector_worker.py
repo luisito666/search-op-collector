@@ -89,7 +89,7 @@ async def search_ml(query: str, limit: int = 50, access_token: str | None = None
                 locale="es-CO",
                 viewport={"width": 1366, "height": 768},
             )
-            await Stealth().apply_stealth(context)
+            await Stealth().apply_stealth_async(context)
             page = await context.new_page()
 
             logger.debug(f"Navigating to: {url}")
