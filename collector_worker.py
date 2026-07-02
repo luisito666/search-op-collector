@@ -94,7 +94,19 @@ async def search_ml(query: str, limit: int = 50, access_token: str | None = None
 
             logger.debug(f"Navigating to: {url}")
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-            await page.wait_for_timeout(5000)
+
+            card_selector = (
+                "li.ui-search-layout__item, div.ui-search-result__wrapper, "
+                "div.ui-search-result, ol.ui-search-layout > li, "
+                "div.andes-card, .poly-card, a[href*=\"MCO-\"]"
+            )
+            try:
+                await page.wait_for_selector(card_selector, timeout=20000)
+            except Exception:
+                logger.warning(
+                    f"Timed out waiting for product cards to hydrate for '{query}' "
+                    "(page may not have rendered results in time)"
+                )
 
             page_title = await page.title()
             page_url = page.url
@@ -208,10 +220,13 @@ async def search_ml(query: str, limit: int = 50, access_token: str | None = None
                 logger.warning("JS extraction found 0 items — falling back to HTML parse")
                 html = await page.content()
 
+                body_html = await page.evaluate(
+                    "() => document.body ? document.body.innerHTML : ''"
+                )
                 html_path = f"/tmp/ml_html_{query.replace(' ', '_')}.html"
                 with open(html_path, "w") as f:
-                    f.write(html[:50000])
-                logger.info(f"HTML saved to {html_path} (first 50KB)")
+                    f.write(body_html[:50000])
+                logger.info(f"Body HTML saved to {html_path} (first 50KB of <body>)")
 
                 soup = BeautifulSoup(html, "html.parser")
                 for link in soup.select('a[href*="/MCO-"]')[:limit]:
