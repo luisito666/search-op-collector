@@ -26,6 +26,7 @@ import logging
 import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
+from playwright_stealth import stealth_sync
 
 # ── Config ──────────────────────────────────────────────────────────
 
@@ -88,11 +89,8 @@ async def search_ml(query: str, limit: int = 50, access_token: str | None = None
                 locale="es-CO",
                 viewport={"width": 1366, "height": 768},
             )
+            await stealth_sync(context)
             page = await context.new_page()
-
-            logger.debug("Visiting ML home page...")
-            await page.goto("https://www.mercadolibre.com.co/", wait_until="domcontentloaded", timeout=15000)
-            await page.wait_for_timeout(3000)
 
             logger.debug(f"Navigating to: {url}")
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
