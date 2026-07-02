@@ -26,7 +26,7 @@ import logging
 import httpx
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
-from playwright_stealth import stealth_sync
+from playwright_stealth import Stealth
 
 # ── Config ──────────────────────────────────────────────────────────
 
@@ -89,7 +89,7 @@ async def search_ml(query: str, limit: int = 50, access_token: str | None = None
                 locale="es-CO",
                 viewport={"width": 1366, "height": 768},
             )
-            await stealth_sync(context)
+            await Stealth().apply_stealth(context)
             page = await context.new_page()
 
             logger.debug(f"Navigating to: {url}")
