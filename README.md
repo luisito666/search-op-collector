@@ -30,8 +30,19 @@ El servidor Search-OP está en un datacenter con IP bloqueada por Mercado Libre 
 git clone https://github.com/luisito666/search-op-collector.git
 cd search-op-collector
 
-# Instalar dependencias (solo httpx)
+# Instalar dependencias
 pip install -r requirements.txt
+```
+
+### Instalación de Playwright
+
+```bash
+pip install playwright
+playwright install chromium
+playwright install-deps  # Instala dependencias del sistema (necesario en Raspberry Pi)
+```
+
+```bash
 
 # Crear archivo .env
 cat > .env << 'EOF'

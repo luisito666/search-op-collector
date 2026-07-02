@@ -19,12 +19,11 @@ Variables opcionales (OAuth, no requeridas para scraping):
 """
 
 import os
-import re
 import sys
 import time
 import logging
 import httpx
-from bs4 import BeautifulSoup
+from playwright.async_api import async_playwright
 
 # ── Config ──────────────────────────────────────────────────────────
 
@@ -59,144 +58,135 @@ async def get_ml_token() -> str:
         return resp.json()["access_token"]
 
 
-async def search_ml(query: str, limit: int = 50, access_token: str | None = None) -> list[dict]:
-    """Busca productos en Mercado Libre Colombia vía scraping HTML.
+async def search_ml(query: str, limit: int = 50) -> list[dict]:
+    """Busca productos en Mercado Libre Colombia usando Playwright (navegador real).
 
-    Desde IP residencial colombiana, la web pública de ML no bloquea.
-    Parseamos los resultados del listado para extraer datos reales de productos.
+    Mercado Libre requiere JavaScript y un navegador real. Playwright lanza
+    Chromium headless que ML no puede distinguir de un usuario genuino.
     """
     encoded_query = query.replace(" ", "-").replace("+", "-")
     url = f"https://listado.mercadolibre.com.co/{encoded_query}"
 
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "es-CO,es;q=0.9,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
-        "DNT": "1",
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-    }
-
-    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-        resp = await client.get(url, headers=headers)
-
-    if resp.status_code != 200:
-        logger.warning(f"ML page returned {resp.status_code} for '{query}'")
-        return []
-
-    if "suspicious-traffic" in resp.text or "account-verification" in resp.text:
-        logger.warning(f"ML returned CAPTCHA/suspicious traffic page for '{query}'")
-        return []
-
-    soup = BeautifulSoup(resp.text, "html.parser")
-
-    items = soup.select("li.ui-search-layout__item, div.ui-search-result__wrapper, ol.ui-search-layout li")
-    if not items:
-        items = soup.select("[class*='ui-search-result']")
-
     results = []
-    for item in items[:limit]:
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ]
+        )
+
         try:
-            title_elem = item.select_one("h2, h3, .ui-search-item__title")
-            title = title_elem.get_text(strip=True) if title_elem else ""
-            if not title:
-                title_elem = item.select_one("a[title]")
-                title = title_elem.get("title", "") if title_elem else ""
-            if not title:
-                continue
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux aarch64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                ),
+                locale="es-CO",
+                viewport={"width": 1366, "height": 768},
+            )
+            page = await context.new_page()
 
-            price_cop = 0.0
-            price_elem = item.select_one(".price-tag-fraction, .andes-money-amount__fraction, span.andes-money-amount__fraction")
-            if price_elem:
-                price_text = price_elem.get_text(strip=True).replace(".", "").replace(",", "")
-                try:
-                    price_cop = float(price_text)
-                except ValueError:
-                    pass
+            # Visit home page first to get session cookies
+            await page.goto("https://www.mercadolibre.com.co/", wait_until="domcontentloaded", timeout=15000)
+            await page.wait_for_timeout(2000)
 
-            permalink = ""
-            link_elem = item.select_one("a.ui-search-link, a[href*='/MCO-']")
-            if link_elem:
-                permalink = link_elem.get("href", "")
-                if permalink and not permalink.startswith("http"):
-                    permalink = "https://www.mercadolibre.com.co" + permalink
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-            ml_product_id = ""
-            if permalink:
-                match = re.search(r'/MCO-(\d+)', permalink)
-                if match:
-                    ml_product_id = match.group(1)
-            if not ml_product_id:
-                item_id_elem = item.select_one("[id*='MLC'], [id*='MCO']")
-                if item_id_elem:
-                    id_match = re.search(r'MCO(\d+)', item_id_elem.get("id", ""))
-                    if id_match:
-                        ml_product_id = id_match.group(1)
-            if not ml_product_id:
-                continue
+            try:
+                await page.wait_for_selector("li.ui-search-layout__item, ol.ui-search-layout li", timeout=10000)
+            except Exception:
+                logger.warning(f"No product cards found for '{query}' after 10s")
+                await browser.close()
+                return []
 
-            thumbnail = ""
-            img_elem = item.select_one("img.ui-search-result-image__element, img[src*='mlstatic'], img[data-src]")
-            if img_elem:
-                thumbnail = img_elem.get("src") or img_elem.get("data-src") or ""
+            for _ in range(min(limit // 24 + 1, 5)):
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(1500)
 
-            sold_quantity = 0
-            sold_elem = item.find(string=re.compile(r'\d+\s+vendido', re.IGNORECASE))
-            if sold_elem:
-                sold_match = re.search(r'(\d+)\s+vendido', sold_elem, re.IGNORECASE)
-                if sold_match:
-                    sold_quantity = int(sold_match.group(1))
+            products = await page.evaluate("""() => {
+                const items = document.querySelectorAll('li.ui-search-layout__item, div.ui-search-result__wrapper, div.andes-card');
+                const results = [];
 
-            seller_nickname = ""
-            seller_elem = item.find(string=re.compile(r'por\s+\w+', re.IGNORECASE))
-            if seller_elem:
-                seller_match = re.search(r'por\s+(\S+)', seller_elem, re.IGNORECASE)
-                if seller_match:
-                    seller_nickname = seller_match.group(1)
+                items.forEach(item => {
+                    const link = item.querySelector('a.ui-search-link, a[href*="/MCO-"]');
+                    if (!link) return;
+                    const href = link.href || link.getAttribute('href') || '';
+                    const idMatch = href.match(/MCO-(\\d+)/);
+                    if (!idMatch) return;
 
-            rating = None
-            rating_elem = item.select_one(".ui-search-reviews__rating, [class*='star']")
-            if rating_elem:
-                rating_text = rating_elem.get_text(strip=True)
-                rating_match = re.search(r'(\d+\.?\d*)', rating_text)
-                if rating_match:
-                    try:
-                        rating = float(rating_match.group(1))
-                    except ValueError:
-                        pass
+                    const titleEl = item.querySelector('h2, h3, .ui-search-item__title');
+                    const title = titleEl ? titleEl.innerText.trim() : (link.title || link.getAttribute('title') || '');
+                    if (!title) return;
 
-            results.append({
-                "ml_product_id": ml_product_id[:20],
-                "title": title[:300],
-                "price_cop": price_cop,
-                "sold_quantity": sold_quantity,
-                "available_quantity": 0,
-                "rating": rating,
-                "seller_id": seller_nickname[:20],
-                "seller_nickname": seller_nickname[:100],
-                "category_id": "",
-                "condition": "new",
-                "thumbnail": thumbnail,
-                "permalink": permalink,
-            })
+                    let price = 0;
+                    const priceEl = item.querySelector('.price-tag-fraction, .andes-money-amount__fraction, span.andes-money-amount__fraction');
+                    if (priceEl) {
+                        price = parseFloat(priceEl.innerText.replace(/\\./g, '').replace(/,/g, '.')) || 0;
+                    }
+
+                    const img = item.querySelector('img.ui-search-result-image__element, img[src*="mlstatic"]');
+                    const thumbnail = img ? (img.src || img.getAttribute('data-src') || '') : '';
+
+                    let soldQuantity = 0;
+                    const soldEl = Array.from(item.querySelectorAll('*')).find(el => /vendido/i.test(el.innerText));
+                    if (soldEl) {
+                        const soldMatch = soldEl.innerText.match(/(\\d+)\\s+vendido/i);
+                        if (soldMatch) soldQuantity = parseInt(soldMatch[1]) || 0;
+                    }
+
+                    let sellerNickname = '';
+                    const sellerEl = Array.from(item.querySelectorAll('*')).find(el => /^por\\s/i.test(el.innerText));
+                    if (sellerEl) {
+                        const sellerMatch = sellerEl.innerText.match(/por\\s+(\\S+)/i);
+                        if (sellerMatch) sellerNickname = sellerMatch[1];
+                    }
+
+                    let rating = null;
+                    const ratingEl = item.querySelector('.ui-search-reviews__rating, [class*="star"]');
+                    if (ratingEl) {
+                        const ratingMatch = ratingEl.innerText.match(/(\\d+\\.?\\d*)/);
+                        if (ratingMatch) rating = parseFloat(ratingMatch[1]) || null;
+                    }
+
+                    results.push({
+                        ml_product_id: idMatch[1].substring(0, 20),
+                        title: title.substring(0, 300),
+                        price_cop: price,
+                        sold_quantity: soldQuantity,
+                        available_quantity: 0,
+                        rating: rating,
+                        seller_id: sellerNickname.substring(0, 20),
+                        seller_nickname: sellerNickname.substring(0, 100),
+                        category_id: '',
+                        condition: 'new',
+                        thumbnail: thumbnail,
+                        permalink: href.startsWith('http') ? href : 'https://www.mercadolibre.com.co' + href,
+                    });
+                });
+
+                return results;
+            }""")
+
+            seen = set()
+            for prod in products:
+                pid = prod.get("ml_product_id", "")
+                if pid and pid not in seen:
+                    seen.add(pid)
+                    results.append(prod)
+
+            logger.info(f"ML scrape '{query}' → {len(results)} productos (Playwright)")
+
         except Exception as e:
-            logger.debug(f"Error parsing item in '{query}': {e}")
-            continue
+            logger.error(f"Playwright error for '{query}': {e}")
+        finally:
+            await browser.close()
 
-    seen = set()
-    unique_results = []
-    for r in results:
-        if r["ml_product_id"] not in seen:
-            seen.add(r["ml_product_id"])
-            unique_results.append(r)
-
-    logger.info(f"ML scrape '{query}' → {len(unique_results)} productos (from HTML)")
-    return unique_results
+    return results[:limit]
 
 
 # ── Server API ──────────────────────────────────────────────────────
@@ -261,7 +251,7 @@ async def process_job(job: dict):
         else:
             await submit_job_results(
                 job_id, "failed", [],
-                error_message=f"Unknown action: {action}"
+                error_message=f"Unknown action: {action}",
             )
     except Exception as e:
         logger.error(f"Job #{job_id} failed: {e}")
